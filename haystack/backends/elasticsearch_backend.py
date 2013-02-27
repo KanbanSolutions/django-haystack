@@ -11,11 +11,7 @@ from haystack.inputs import PythonData, Clean, Exact
 from haystack.models import SearchResult
 from haystack.utils import get_identifier
 from haystack.utils import log as logging
-try:
-    from django.db.models.sql.query import get_proxied_model
-except ImportError:
-    # Likely on Django 1.0
-    get_proxied_model = None
+
 try:
     import requests
 except ImportError:
@@ -127,7 +123,7 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
             try:
                 # Make sure the index is there first.
                 self.conn.create_index(self.index_name, self.DEFAULT_SETTINGS)
-                self.conn.put_mapping('modelresult', current_mapping, index=self.index_name)
+                self.conn.put_mapping(self.index_name, 'modelresult', current_mapping)
                 self.existing_mapping = current_mapping
             except Exception:
                 if not self.silently_fail:
@@ -410,11 +406,11 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
                     within['field']: {
                         "top_left": {
                             "lat": max_lat,
-                            "lon": max_lng
+                            "lon": min_lng
                         },
                         "bottom_right": {
                             "lat": min_lat,
-                            "lon": min_lng
+                            "lon": max_lng
                         }
                     }
                 },
@@ -477,6 +473,13 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         search_kwargs = self.build_search_kwargs(query_string, **kwargs)
         search_kwargs['from'] = kwargs.get('start_offset', 0)
 
+        order_fields = set()
+        for order in search_kwargs.get('sort', []):
+            for key in order.keys():
+                order_fields.add(key)
+
+        geo_sort = '_geo_distance' in order_fields
+
         end_offset = kwargs.get('end_offset')
         start_offset = kwargs.get('start_offset', 0)
         if end_offset is not None and end_offset > start_offset:
@@ -493,8 +496,10 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
             self.log.error("Failed to query Elasticsearch using '%s': %s", query_string, e)
             raw_results = {}
 
-        return self._process_results(raw_results, highlight=kwargs.get('highlight'),
-                                     result_class=kwargs.get('result_class', SearchResult))
+        return self._process_results(raw_results,
+            highlight=kwargs.get('highlight'),
+            result_class=kwargs.get('result_class', SearchResult),
+            distance_point=kwargs.get('distance_point'), geo_sort=geo_sort)
 
     def more_like_this(self, model_instance, additional_query_string=None,
                        start_offset=0, end_offset=None, models=None,
@@ -504,11 +509,9 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         if not self.setup_complete:
             self.setup()
 
-        # Handle deferred models.
-        if get_proxied_model and hasattr(model_instance, '_deferred') and model_instance._deferred:
-            model_klass = get_proxied_model(model_instance._meta)
-        else:
-            model_klass = type(model_instance)
+        # Deferred models will have a different class ("RealClass_Deferred_fieldname")
+        # which won't be in our registry:
+        model_klass = model_instance._meta.concrete_model
 
         index = connections[self.connection_alias].get_unified_index().get_index(model_klass)
         field_name = index.get_content_field()
@@ -533,7 +536,9 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
 
         return self._process_results(raw_results, result_class=result_class)
 
-    def _process_results(self, raw_results, highlight=False, result_class=None):
+    def _process_results(self, raw_results, highlight=False,
+                         result_class=None, distance_point=None,
+                         geo_sort=False):
         from haystack import connections
         results = []
         hits = raw_results.get('hits', {}).get('total', 0)
@@ -585,6 +590,15 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
 
                 if 'highlight' in raw_result:
                     additional_fields['highlighted'] = raw_result['highlight'].get(content_field, '')
+
+                if distance_point:
+                    additional_fields['_point_of_origin'] = distance_point
+
+                    if geo_sort and raw_result.get('sort'):
+                        from haystack.utils.geo import Distance
+                        additional_fields['_distance'] = Distance(km=float(raw_result['sort'][0]))
+                    else:
+                        additional_fields['_distance'] = None
 
                 result = result_class(app_label, model_name, source[DJANGO_ID], raw_result['_score'], **additional_fields)
                 results.append(result)
