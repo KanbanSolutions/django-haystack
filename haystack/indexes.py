@@ -334,6 +334,23 @@ class SearchIndex(threading.local):
 class BasicSearchIndex(SearchIndex):
     text = CharField(document=True, use_template=True)
 
+class RealTimeSearchIndex(SearchIndex):
+    """
+    A variant of the ``SearchIndex`` that constantly keeps the index fresh,
+    as opposed to requiring a cron job.
+    """
+    def _setup_save(self):
+        signals.post_save.connect(self.update_object, sender=self.get_model())
+
+    def _setup_delete(self):
+        signals.post_delete.connect(self.remove_object, sender=self.get_model())
+
+    def _teardown_save(self):
+        signals.post_save.disconnect(self.update_object, sender=self.get_model())
+
+    def _teardown_delete(self):
+        signals.post_delete.disconnect(self.remove_object, sender=self.get_model())
+
 
 # End SearchIndexes
 # Begin ModelSearchIndexes
